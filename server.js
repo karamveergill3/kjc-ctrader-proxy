@@ -1,6 +1,6 @@
 /**
- * KJC Arena — cTrader Open API Proxy Server v6
- * Fixed: proper int64 reading for large account IDs
+ * KJC Arena — cTrader Open API Proxy Server v7
+ * FIXED: accounts in field 4, accountId in field 1
  */
 const tls = require("tls");
 const express = require("express");
@@ -13,157 +13,114 @@ const PORT = process.env.PORT || 3001;
 const CTRADER_HOST = "live.ctraderapi.com";
 const CTRADER_PORT = 5035;
 
-const PT = {
-  APP_AUTH_REQ: 2100, APP_AUTH_RES: 2101,
-  ACCOUNT_AUTH_REQ: 2102, ACCOUNT_AUTH_RES: 2103,
-  GET_ACCOUNTS_REQ: 2149, GET_ACCOUNTS_RES: 2150,
-  DEAL_LIST_REQ: 2140, DEAL_LIST_RES: 2141,
-  ERROR_RES: 2142, HEARTBEAT: 51,
-};
+const PT = { APP_AUTH_REQ:2100,APP_AUTH_RES:2101,ACCOUNT_AUTH_REQ:2102,ACCOUNT_AUTH_RES:2103,GET_ACCOUNTS_REQ:2149,GET_ACCOUNTS_RES:2150,DEAL_LIST_REQ:2140,DEAL_LIST_RES:2141,ERROR_RES:2142,HEARTBEAT:51 };
 
-// ── Varint with BigInt support for int64 ──────────────────────────────────────
 function encodeVarint(n) {
-  const out = []; n = Number(n);
-  while (n > 127) { out.push((n & 0x7f) | 0x80); n = Math.floor(n / 128); }
-  out.push(n & 0x7f); return Buffer.from(out);
+  const out=[]; n=Number(n);
+  while(n>127){out.push((n&0x7f)|0x80);n=Math.floor(n/128);}
+  out.push(n&0x7f); return Buffer.from(out);
 }
 
-function decodeVarint(buf, pos) {
-  let result = BigInt(0), shift = BigInt(0);
-  while (pos < buf.length) {
-    const b = buf[pos++];
-    result |= BigInt(b & 0x7f) << shift;
-    shift += BigInt(7);
-    if (!(b & 0x80)) break;
-  }
-  return [result, pos];
+function decodeVarint(buf,pos) {
+  let result=BigInt(0),shift=BigInt(0);
+  while(pos<buf.length){const b=buf[pos++];result|=BigInt(b&0x7f)<<shift;shift+=BigInt(7);if(!(b&0x80))break;}
+  return[result,pos];
 }
 
 function pbDecode(buf) {
-  const fields = {}; let pos = 0;
-  while (pos < buf.length) {
-    let tag; [tag, pos] = decodeVarint(buf, pos);
-    const fn = Number(tag >> BigInt(3)), wt = Number(tag & BigInt(7));
-    let val;
-    if (wt === 0) { [val, pos] = decodeVarint(buf, pos); }
-    else if (wt === 2) {
-      let len; [len, pos] = decodeVarint(buf, pos);
-      len = Number(len);
-      val = buf.slice(pos, pos + len); pos += len;
-    }
-    else if (wt === 1) { pos += 8; continue; }
-    else if (wt === 5) { pos += 4; continue; }
+  const fields={}; let pos=0;
+  while(pos<buf.length){
+    let tag; [tag,pos]=decodeVarint(buf,pos);
+    const fn=Number(tag>>BigInt(3)),wt=Number(tag&BigInt(7)); let val;
+    if(wt===0){[val,pos]=decodeVarint(buf,pos);}
+    else if(wt===2){let len;[len,pos]=decodeVarint(buf,pos);len=Number(len);val=buf.slice(pos,pos+len);pos+=len;}
+    else if(wt===1){pos+=8;continue;}
+    else if(wt===5){pos+=4;continue;}
     else break;
-    if (val === undefined) continue;
-    if (fields[fn] === undefined) fields[fn] = val;
-    else if (Array.isArray(fields[fn])) fields[fn].push(val);
-    else fields[fn] = [fields[fn], val];
+    if(val===undefined)continue;
+    if(fields[fn]===undefined)fields[fn]=val;
+    else if(Array.isArray(fields[fn]))fields[fn].push(val);
+    else fields[fn]=[fields[fn],val];
   }
   return fields;
 }
 
-function pbField(fn, wt, val) {
-  const tag = encodeVarint((fn << 3) | wt);
-  if (wt === 0) return Buffer.concat([tag, encodeVarint(val)]);
-  const vb = Buffer.isBuffer(val) ? val : Buffer.from(String(val), "utf8");
-  return Buffer.concat([tag, encodeVarint(vb.length), vb]);
+function pbField(fn,wt,val) {
+  const tag=encodeVarint((fn<<3)|wt);
+  if(wt===0)return Buffer.concat([tag,encodeVarint(val)]);
+  const vb=Buffer.isBuffer(val)?val:Buffer.from(String(val),"utf8");
+  return Buffer.concat([tag,encodeVarint(vb.length),vb]);
 }
 
-function frame(payloadType, payload) {
-  const msg = Buffer.concat([pbField(1, 0, payloadType), pbField(2, 2, payload)]);
-  const len = Buffer.alloc(4); len.writeUInt32BE(msg.length, 0);
-  return Buffer.concat([len, msg]);
+function encodeInt64Field(fn,value) {
+  const tag=encodeVarint((fn<<3)|0); const out=[];
+  let n=BigInt(value);
+  while(n>BigInt(127)){out.push(Number(n&BigInt(0x7f))|0x80);n>>=BigInt(7);}
+  out.push(Number(n&BigInt(0x7f)));
+  return Buffer.concat([tag,Buffer.from(out)]);
 }
 
-// Encode int64 varint properly for large account IDs
-function encodeInt64Field(fn, value) {
-  const tag = encodeVarint((fn << 3) | 0);
-  const out = [];
-  let n = BigInt(value);
-  while (n > BigInt(127)) {
-    out.push(Number(n & BigInt(0x7f)) | 0x80);
-    n >>= BigInt(7);
-  }
-  out.push(Number(n & BigInt(0x7f)));
-  return Buffer.concat([tag, Buffer.from(out)]);
+function frame(pt,payload) {
+  const msg=Buffer.concat([pbField(1,0,pt),pbField(2,2,payload)]);
+  const len=Buffer.alloc(4);len.writeUInt32BE(msg.length,0);
+  return Buffer.concat([len,msg]);
 }
 
-const buildAppAuth = (id, sec) => frame(PT.APP_AUTH_REQ,
-  Buffer.concat([pbField(2, 2, id), pbField(3, 2, sec)]));
-
-const buildGetAccounts = (tok) => frame(PT.GET_ACCOUNTS_REQ, pbField(2, 2, tok));
-
-function buildAccountAuth(accId, tok) {
-  return frame(PT.ACCOUNT_AUTH_REQ,
-    Buffer.concat([encodeInt64Field(2, accId), pbField(3, 2, tok)]));
-}
-
-function buildDealList(accId, from, to) {
-  return frame(PT.DEAL_LIST_REQ, Buffer.concat([
-    encodeInt64Field(2, accId),
-    encodeInt64Field(3, from),
-    encodeInt64Field(4, to),
-    pbField(5, 0, 1000)
-  ]));
-}
+const buildAppAuth=(id,sec)=>frame(PT.APP_AUTH_REQ,Buffer.concat([pbField(2,2,id),pbField(3,2,sec)]));
+const buildGetAccounts=(tok)=>frame(PT.GET_ACCOUNTS_REQ,pbField(2,2,tok));
+const buildAccountAuth=(accId,tok)=>frame(PT.ACCOUNT_AUTH_REQ,Buffer.concat([encodeInt64Field(2,accId),pbField(3,2,tok)]));
+const buildDealList=(accId,from,to)=>frame(PT.DEAL_LIST_REQ,Buffer.concat([encodeInt64Field(2,accId),encodeInt64Field(3,from),encodeInt64Field(4,to),pbField(5,0,1000)]));
 
 function connect() {
-  return new Promise((resolve, reject) => {
-    const s = tls.connect({ host: CTRADER_HOST, port: CTRADER_PORT, rejectUnauthorized: false }, () => resolve(s));
-    s.on("error", reject);
-    setTimeout(() => { s.destroy(); reject(new Error("TCP timeout")); }, 20000);
+  return new Promise((resolve,reject)=>{
+    const s=tls.connect({host:CTRADER_HOST,port:CTRADER_PORT,rejectUnauthorized:false},()=>resolve(s));
+    s.on("error",reject);
+    setTimeout(()=>{s.destroy();reject(new Error("TCP timeout"));},20000);
   });
 }
 
-function sendRecv(socket, msg, expectedPT, ms = 20000) {
-  return new Promise((resolve, reject) => {
-    let buf = Buffer.alloc(0);
-    const timer = setTimeout(() => {
-      socket.removeListener("data", onData);
-      reject(new Error(`Timeout PT ${expectedPT}`));
-    }, ms);
+function sendRecv(socket,msg,expectedPT,ms=20000) {
+  return new Promise((resolve,reject)=>{
+    let buf=Buffer.alloc(0);
+    const timer=setTimeout(()=>{socket.removeListener("data",onData);reject(new Error(`Timeout PT ${expectedPT}`));},ms);
     function onData(chunk) {
-      buf = Buffer.concat([buf, chunk]);
-      while (buf.length >= 4) {
-        const mlen = buf.readUInt32BE(0);
-        if (buf.length < 4 + mlen) break;
-        const mbuf = buf.slice(4, 4 + mlen); buf = buf.slice(4 + mlen);
-        const outer = pbDecode(mbuf);
-        const pt = Number(outer[1]); const payload = outer[2] || Buffer.alloc(0);
+      buf=Buffer.concat([buf,chunk]);
+      while(buf.length>=4){
+        const mlen=buf.readUInt32BE(0);
+        if(buf.length<4+mlen)break;
+        const mbuf=buf.slice(4,4+mlen);buf=buf.slice(4+mlen);
+        const outer=pbDecode(mbuf);
+        const pt=Number(outer[1]);const payload=outer[2]||Buffer.alloc(0);
         console.log(`RX pt=${pt}`);
-        if (pt === PT.HEARTBEAT) { socket.write(frame(PT.HEARTBEAT, Buffer.alloc(0))); continue; }
-        if (pt === PT.ERROR_RES) {
-          const e = pbDecode(payload);
-          const code = e[2] ? (Buffer.isBuffer(e[2]) ? e[2].toString() : String(e[2])) : "ERR";
-          const desc = e[3] ? (Buffer.isBuffer(e[3]) ? e[3].toString() : String(e[3])) : "";
-          clearTimeout(timer); socket.removeListener("data", onData);
+        if(pt===PT.HEARTBEAT){socket.write(frame(PT.HEARTBEAT,Buffer.alloc(0)));continue;}
+        if(pt===PT.ERROR_RES){
+          const e=pbDecode(payload);
+          const code=e[2]?(Buffer.isBuffer(e[2])?e[2].toString():String(e[2])):"ERR";
+          const desc=e[3]?(Buffer.isBuffer(e[3])?e[3].toString():String(e[3])):"";
+          clearTimeout(timer);socket.removeListener("data",onData);
           return reject(new Error(`cTrader ${code}: ${desc}`));
         }
-        if (pt === expectedPT) { clearTimeout(timer); socket.removeListener("data", onData); return resolve(payload); }
+        if(pt===expectedPT){clearTimeout(timer);socket.removeListener("data",onData);return resolve(payload);}
       }
     }
-    socket.on("data", onData); socket.write(msg);
+    socket.on("data",onData);socket.write(msg);
   });
 }
 
 function parseAccounts(payload) {
-  console.log("ACC hex:", payload.slice(0, 80).toString("hex"));
-  const top = pbDecode(payload);
-  console.log("ACC fields:", Object.keys(top));
-  const accounts = [];
-  // field 3 = repeated ProtoOACtidTraderAccount
-  const raw = top[3];
-  if (!raw) { console.log("No field 3"); return accounts; }
-  const items = Array.isArray(raw) ? raw : [raw];
-  for (const item of items) {
-    if (!Buffer.isBuffer(item)) continue;
-    const acc = pbDecode(item);
-    console.log("Account item fields:", Object.keys(acc), "values:", JSON.stringify(
-      Object.fromEntries(Object.entries(acc).map(([k,v]) => [k, typeof v === 'bigint' ? v.toString() : Buffer.isBuffer(v) ? v.toString('hex') : v]))
-    ));
-    // field 2 = ctidTraderAccountId (int64)
-    if (acc[2] !== undefined) {
-      const id = typeof acc[2] === 'bigint' ? acc[2] : BigInt(acc[2]);
+  const top=pbDecode(payload);
+  console.log("ACC top fields:",Object.keys(top));
+  const accounts=[];
+  // field 4 = repeated ProtoOACtidTraderAccount, field 1 inside = ctidTraderAccountId
+  const raw=top[4];
+  if(!raw){console.log("No field 4");return accounts;}
+  const items=Array.isArray(raw)?raw:[raw];
+  for(const item of items){
+    if(!Buffer.isBuffer(item))continue;
+    const acc=pbDecode(item);
+    console.log("Account sub fields:",Object.keys(acc));
+    if(acc[1]!==undefined){
+      const id=typeof acc[1]==='bigint'?acc[1]:BigInt(acc[1]);
       accounts.push(id);
       console.log(`Account ID: ${id}`);
     }
@@ -172,65 +129,65 @@ function parseAccounts(payload) {
 }
 
 function parseDeals(payload) {
-  const top = pbDecode(payload);
-  const raw = top[3]; if (!raw) return [];
-  return Array.isArray(raw) ? raw : [raw];
+  const top=pbDecode(payload);
+  const raw=top[3];if(!raw)return[];
+  return Array.isArray(raw)?raw:[raw];
 }
 
 function computeStats(dealBufs) {
-  const profits = [];
-  for (const d of dealBufs) {
-    if (!Buffer.isBuffer(d)) continue;
-    const deal = pbDecode(d);
-    if (Number(deal[7]) !== 2) continue;
-    if (!deal[10] || !Buffer.isBuffer(deal[10])) continue;
-    const cpd = pbDecode(deal[10]);
-    const gp = cpd[3] !== undefined ? Number(cpd[3]) : 0;
-    const md = cpd[9] !== undefined ? Number(cpd[9]) : 2;
-    profits.push(gp / Math.pow(10, md));
+  const profits=[];
+  for(const d of dealBufs){
+    if(!Buffer.isBuffer(d))continue;
+    const deal=pbDecode(d);
+    if(Number(deal[7])!==2)continue;
+    if(!deal[10]||!Buffer.isBuffer(deal[10]))continue;
+    const cpd=pbDecode(deal[10]);
+    const gp=cpd[3]!==undefined?Number(cpd[3]):0;
+    const md=cpd[9]!==undefined?Number(cpd[9]):2;
+    profits.push(gp/Math.pow(10,md));
   }
-  if (!profits.length) return { trades: 0, pf: 0, wr: 0, dd: 0, netProfit: 0 };
-  const wins = profits.filter(p => p > 0), losses = profits.filter(p => p < 0);
-  const gpp = wins.reduce((s, p) => s + p, 0), gll = Math.abs(losses.reduce((s, p) => s + p, 0));
-  const pf = gll > 0 ? gpp / gll : gpp > 0 ? 9.99 : 0;
-  const wr = (wins.length / profits.length) * 100;
-  const net = profits.reduce((s, p) => s + p, 0);
-  let peak = 0, maxDD = 0, cum = 0;
-  profits.forEach(p => { cum += p; if (cum > peak) peak = cum; const dd = peak > 0 ? ((peak - cum) / peak) * 100 : 0; if (dd > maxDD) maxDD = dd; });
-  return { trades: profits.length, wins: wins.length, losses: losses.length, pf: Math.round(pf * 100) / 100, wr: Math.round(wr * 10) / 10, dd: Math.round(maxDD * 10) / 10, netProfit: Math.round(net * 100) / 100 };
+  if(!profits.length)return{trades:0,pf:0,wr:0,dd:0,netProfit:0};
+  const wins=profits.filter(p=>p>0),losses=profits.filter(p=>p<0);
+  const gpp=wins.reduce((s,p)=>s+p,0),gll=Math.abs(losses.reduce((s,p)=>s+p,0));
+  const pf=gll>0?gpp/gll:gpp>0?9.99:0;
+  const wr=(wins.length/profits.length)*100;
+  const net=profits.reduce((s,p)=>s+p,0);
+  let peak=0,maxDD=0,cum=0;
+  profits.forEach(p=>{cum+=p;if(cum>peak)peak=cum;const dd=peak>0?((peak-cum)/peak)*100:0;if(dd>maxDD)maxDD=dd;});
+  return{trades:profits.length,wins:wins.length,losses:losses.length,pf:Math.round(pf*100)/100,wr:Math.round(wr*10)/10,dd:Math.round(maxDD*10)/10,netProfit:Math.round(net*100)/100};
 }
 
-async function fetchOOS(token, months) {
-  const socket = await connect();
+async function fetchOOS(token,months) {
+  const socket=await connect();
   try {
-    await sendRecv(socket, buildAppAuth(CLIENT_ID, CLIENT_SECRET), PT.APP_AUTH_RES);
+    await sendRecv(socket,buildAppAuth(CLIENT_ID,CLIENT_SECRET),PT.APP_AUTH_RES);
     console.log("App auth OK");
-    const accPay = await sendRecv(socket, buildGetAccounts(token), PT.GET_ACCOUNTS_RES);
-    const accounts = parseAccounts(accPay);
-    console.log("Accounts:", accounts.map(a => a.toString()));
-    if (!accounts.length) throw new Error("No accounts found");
-    const accId = accounts[0];
-    await sendRecv(socket, buildAccountAuth(accId, token), PT.ACCOUNT_AUTH_RES);
-    console.log("Account auth OK for", accId.toString());
-    const to = BigInt(Date.now()), from = to - BigInt(months) * BigInt(30 * 24 * 60 * 60 * 1000);
-    const dealPay = await sendRecv(socket, buildDealList(accId, from, to), PT.DEAL_LIST_RES);
-    const deals = parseDeals(dealPay);
+    const accPay=await sendRecv(socket,buildGetAccounts(token),PT.GET_ACCOUNTS_RES);
+    const accounts=parseAccounts(accPay);
+    console.log("Accounts:",accounts.map(a=>a.toString()));
+    if(!accounts.length)throw new Error("No accounts found");
+    const accId=accounts[0];
+    await sendRecv(socket,buildAccountAuth(accId,token),PT.ACCOUNT_AUTH_RES);
+    console.log("Account auth OK for",accId.toString());
+    const to=BigInt(Date.now()),from=to-BigInt(months)*BigInt(30*24*60*60*1000);
+    const dealPay=await sendRecv(socket,buildDealList(accId,from,to),PT.DEAL_LIST_RES);
+    const deals=parseDeals(dealPay);
     console.log(`Got ${deals.length} deals`);
     socket.destroy();
     return computeStats(deals);
-  } catch (e) { socket.destroy(); throw e; }
+  } catch(e){socket.destroy();throw e;}
 }
 
-app.get("/health", (req, res) => res.json({ status: "ok", configured: !!(CLIENT_ID && CLIENT_SECRET) }));
+app.get("/health",(req,res)=>res.json({status:"ok",configured:!!(CLIENT_ID&&CLIENT_SECRET)}));
 
-app.get("/oos", async (req, res) => {
-  const { token, months = 3 } = req.query;
-  if (!token) return res.status(401).json({ error: "No token" });
-  if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).json({ error: "Env vars missing" });
-  try {
-    const stats = await fetchOOS(token, parseInt(months));
-    res.json({ ...stats, period: `Last ${months} months` });
-  } catch (e) { console.error("Error:", e.message); res.status(500).json({ error: e.message }); }
+app.get("/oos",async(req,res)=>{
+  const{token,months=3}=req.query;
+  if(!token)return res.status(401).json({error:"No token"});
+  if(!CLIENT_ID||!CLIENT_SECRET)return res.status(500).json({error:"Env vars missing"});
+  try{
+    const stats=await fetchOOS(token,parseInt(months));
+    res.json({...stats,period:`Last ${months} months`});
+  }catch(e){console.error("Error:",e.message);res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT, () => console.log(`cTrader proxy v6 on port ${PORT}`));
+app.listen(PORT,()=>console.log(`cTrader proxy v7 on port ${PORT}`));
