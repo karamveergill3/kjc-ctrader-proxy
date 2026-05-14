@@ -1,6 +1,6 @@
 /**
- * KJC Arena — cTrader Open API Proxy Server v8
- * Auto-detects live vs demo account and routes correctly
+ * KJC Arena — cTrader Open API Proxy Server v9
+ * Fixed: deal list timestamps, proper demo flow
  */
 const tls = require("tls");
 const express = require("express");
@@ -50,12 +50,15 @@ function pbField(fn,wt,val) {
   return Buffer.concat([tag,encodeVarint(vb.length),vb]);
 }
 
-function encodeInt64Field(fn,value) {
-  const tag=encodeVarint((fn<<3)|0); const out=[];
-  let n=BigInt(value);
+function encodeInt64(value) {
+  const out=[]; let n=BigInt(value);
   while(n>BigInt(127)){out.push(Number(n&BigInt(0x7f))|0x80);n>>=BigInt(7);}
   out.push(Number(n&BigInt(0x7f)));
-  return Buffer.concat([tag,Buffer.from(out)]);
+  return Buffer.from(out);
+}
+
+function encodeInt64Field(fn,value) {
+  return Buffer.concat([encodeVarint((fn<<3)|0), encodeInt64(value)]);
 }
 
 function frame(pt,payload) {
@@ -67,7 +70,19 @@ function frame(pt,payload) {
 const buildAppAuth=(id,sec)=>frame(PT.APP_AUTH_REQ,Buffer.concat([pbField(2,2,id),pbField(3,2,sec)]));
 const buildGetAccounts=(tok)=>frame(PT.GET_ACCOUNTS_REQ,pbField(2,2,tok));
 const buildAccountAuth=(accId,tok)=>frame(PT.ACCOUNT_AUTH_REQ,Buffer.concat([encodeInt64Field(2,accId),pbField(3,2,tok)]));
-const buildDealList=(accId,from,to)=>frame(PT.DEAL_LIST_REQ,Buffer.concat([encodeInt64Field(2,accId),encodeInt64Field(3,from),encodeInt64Field(4,to),pbField(5,0,1000)]));
+
+function buildDealList(accId,fromMs,toMs) {
+  // Clamp timestamps to valid range (cTrader max: 2147483646000)
+  const MAX_TS = BigInt(2147483646000);
+  const to = BigInt(toMs) > MAX_TS ? MAX_TS : BigInt(toMs);
+  const from = BigInt(fromMs);
+  return frame(PT.DEAL_LIST_REQ, Buffer.concat([
+    encodeInt64Field(2, accId),
+    encodeInt64Field(3, from),
+    encodeInt64Field(4, to),
+    pbField(5, 0, 500)
+  ]));
+}
 
 function connect(host) {
   return new Promise((resolve,reject)=>{
@@ -108,8 +123,6 @@ function sendRecv(socket,msg,expectedPT,ms=20000) {
 function parseAccounts(payload) {
   const top=pbDecode(payload);
   const accounts=[];
-  // field 4 = repeated ProtoOACtidTraderAccount
-  // field 1 = ctidTraderAccountId, field 5 = isLive (bool)
   const raw=top[4];
   if(!raw)return accounts;
   const items=Array.isArray(raw)?raw:[raw];
@@ -118,10 +131,9 @@ function parseAccounts(payload) {
     const acc=pbDecode(item);
     if(acc[1]!==undefined){
       const id=typeof acc[1]==='bigint'?acc[1]:BigInt(acc[1]);
-      // field 5 = isLive (1=live, 0=demo)
       const isLive=acc[5]!==undefined?Number(acc[5])===1:false;
       accounts.push({id,isLive});
-      console.log(`Account ID: ${id}, isLive: ${isLive}`);
+      console.log(`Account ${id} isLive=${isLive}`);
     }
   }
   return accounts;
@@ -157,40 +169,42 @@ function computeStats(dealBufs) {
 }
 
 async function fetchOOS(token,months) {
-  // Step 1: Connect to live to get account list
-  console.log("Connecting to live server to get accounts...");
+  // 1. Get account list from live server
   const liveSocket=await connect("live.ctraderapi.com");
   let accounts=[];
-  try {
+  try{
     await sendRecv(liveSocket,buildAppAuth(CLIENT_ID,CLIENT_SECRET),PT.APP_AUTH_RES);
     const accPay=await sendRecv(liveSocket,buildGetAccounts(token),PT.GET_ACCOUNTS_RES);
     accounts=parseAccounts(accPay);
     liveSocket.destroy();
-  } catch(e){liveSocket.destroy();throw e;}
+  }catch(e){liveSocket.destroy();throw e;}
 
-  if(!accounts.length)throw new Error("No accounts found for this token");
-  console.log("All accounts:",accounts.map(a=>`${a.id}(${a.isLive?'live':'demo'})`).join(', '));
+  if(!accounts.length)throw new Error("No accounts found");
 
-  // Step 2: Pick best account — prefer live, fall back to demo
-  const liveAcc=accounts.find(a=>a.isLive);
-  const chosen=liveAcc||accounts[0];
+  // 2. Pick live account first, else demo
+  const chosen=accounts.find(a=>a.isLive)||accounts[0];
   const host=chosen.isLive?"live.ctraderapi.com":"demo.ctraderapi.com";
-  console.log(`Using account ${chosen.id} on ${host}`);
+  console.log(`Using account ${chosen.id} (${chosen.isLive?'live':'demo'}) on ${host}`);
 
-  // Step 3: Connect to correct server and fetch deals
+  // 3. Connect to correct server, auth, fetch deals
   const socket=await connect(host);
-  try {
+  try{
     await sendRecv(socket,buildAppAuth(CLIENT_ID,CLIENT_SECRET),PT.APP_AUTH_RES);
+    console.log("App auth OK on",host);
     await sendRecv(socket,buildAccountAuth(chosen.id,token),PT.ACCOUNT_AUTH_RES);
     console.log("Account auth OK");
-    const to=BigInt(Date.now()),from=to-BigInt(months)*BigInt(30*24*60*60*1000);
-    const dealPay=await sendRecv(socket,buildDealList(chosen.id,from,to),PT.DEAL_LIST_RES);
+
+    const toMs=Date.now();
+    const fromMs=toMs-(months*30*24*60*60*1000);
+    console.log(`Fetching deals from=${new Date(fromMs).toISOString()} to=${new Date(toMs).toISOString()}`);
+
+    const dealPay=await sendRecv(socket,buildDealList(chosen.id,fromMs,toMs),PT.DEAL_LIST_RES);
     const deals=parseDeals(dealPay);
     console.log(`Got ${deals.length} deals`);
     socket.destroy();
     const stats=computeStats(deals);
-    return{...stats,accountId:chosen.id.toString(),accountType:chosen.isLive?'live':'demo'};
-  } catch(e){socket.destroy();throw e;}
+    return{...stats,accountType:chosen.isLive?'live':'demo',period:`Last ${months} months`};
+  }catch(e){socket.destroy();throw e;}
 }
 
 app.get("/health",(req,res)=>res.json({status:"ok",configured:!!(CLIENT_ID&&CLIENT_SECRET)}));
@@ -201,8 +215,8 @@ app.get("/oos",async(req,res)=>{
   if(!CLIENT_ID||!CLIENT_SECRET)return res.status(500).json({error:"Env vars missing"});
   try{
     const stats=await fetchOOS(token,parseInt(months));
-    res.json({...stats,period:`Last ${months} months`});
+    res.json(stats);
   }catch(e){console.error("Error:",e.message);res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,()=>console.log(`cTrader proxy v8 on port ${PORT}`));
+app.listen(PORT,()=>console.log(`cTrader proxy v9 on port ${PORT}`));
