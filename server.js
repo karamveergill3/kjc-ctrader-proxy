@@ -1,12 +1,6 @@
 /**
- * KJC Arena — cTrader Open API Proxy Server
- * Deploy to Railway: https://railway.app
- * 
- * Connects to cTrader via TCP/TLS + protobuf
- * Exposes a simple HTTP endpoint for Vercel to call
+ * KJC Arena — cTrader Open API Proxy Server v2
  */
-
-const net = require("net");
 const tls = require("tls");
 const express = require("express");
 const app = express();
@@ -15,343 +9,190 @@ app.use(express.json());
 const CLIENT_ID = process.env.CTRADER_CLIENT_ID;
 const CLIENT_SECRET = process.env.CTRADER_CLIENT_SECRET;
 const PORT = process.env.PORT || 3001;
-
-// ── cTrader API constants ────────────────────────────────────────────────────
 const CTRADER_HOST = "live.ctraderapi.com";
 const CTRADER_PORT = 5035;
 
-// Payload type IDs (from cTrader proto definitions)
-const PayloadType = {
-  PROTO_OA_APPLICATION_AUTH_REQ: 2100,
-  PROTO_OA_APPLICATION_AUTH_RES: 2101,
-  PROTO_OA_ACCOUNT_AUTH_REQ: 2102,
-  PROTO_OA_ACCOUNT_AUTH_RES: 2103,
-  PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_REQ: 2149,
-  PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_RES: 2150,
-  PROTO_OA_DEAL_LIST_REQ: 2140,
-  PROTO_OA_DEAL_LIST_RES: 2141,
-  PROTO_OA_ERROR_RES: 2142,
-  PROTO_MESSAGE: 5,
-};
+const PT = { APP_AUTH_REQ:2100, APP_AUTH_RES:2101, ACCOUNT_AUTH_REQ:2102, ACCOUNT_AUTH_RES:2103, GET_ACCOUNTS_REQ:2149, GET_ACCOUNTS_RES:2150, DEAL_LIST_REQ:2140, DEAL_LIST_RES:2141, ERROR_RES:2142 };
 
-// ── Protobuf-lite encoder/decoder ────────────────────────────────────────────
-// We implement a minimal protobuf encoder without the full library
-// since we only need a handful of message types
-
-function encodeVarint(value) {
-  const bytes = [];
-  while (value > 0x7f) {
-    bytes.push((value & 0x7f) | 0x80);
-    value = value >>> 7;
-  }
-  bytes.push(value & 0x7f);
-  return Buffer.from(bytes);
+function encodeVarint(n) {
+  const out = []; n = Number(n);
+  while (n > 127) { out.push((n & 0x7f)|0x80); n = Math.floor(n/128); }
+  out.push(n & 0x7f); return Buffer.from(out);
 }
 
-function writeField(fieldNum, type, value) {
-  // type: 0=varint, 2=length-delimited
-  const tag = (fieldNum << 3) | type;
-  const tagBuf = encodeVarint(tag);
-  if (type === 0) {
-    return Buffer.concat([tagBuf, encodeVarint(value)]);
-  } else {
-    const valBuf = Buffer.isBuffer(value) ? value : Buffer.from(value, "utf8");
-    return Buffer.concat([tagBuf, encodeVarint(valBuf.length), valBuf]);
-  }
-}
-
-function readVarint(buf, offset) {
-  let result = 0, shift = 0;
-  while (offset < buf.length) {
-    const byte = buf[offset++];
-    result |= (byte & 0x7f) << shift;
+function decodeVarint(buf, pos) {
+  let result=0, shift=0;
+  while (pos < buf.length) {
+    const b = buf[pos++];
+    result += (b & 0x7f) * Math.pow(2, shift);
     shift += 7;
-    if (!(byte & 0x80)) break;
+    if (!(b & 0x80)) break;
   }
-  return { value: result, offset };
+  return [result, pos];
 }
 
-function decodeMessage(buf) {
-  const fields = {};
-  let offset = 0;
-  while (offset < buf.length) {
-    const tag = readVarint(buf, offset);
-    offset = tag.offset;
-    const fieldNum = tag.value >> 3;
-    const wireType = tag.value & 0x7;
-    if (wireType === 0) {
-      const v = readVarint(buf, offset);
-      offset = v.offset;
-      fields[fieldNum] = v.value;
-    } else if (wireType === 2) {
-      const len = readVarint(buf, offset);
-      offset = len.offset;
-      fields[fieldNum] = buf.slice(offset, offset + len.value);
-      offset += len.value;
-    } else {
-      break; // unsupported wire type
-    }
+function pbDecode(buf) {
+  const fields = {}; let pos = 0;
+  while (pos < buf.length) {
+    let tag, val;
+    [tag, pos] = decodeVarint(buf, pos);
+    const fn = tag >>> 3, wt = tag & 7;
+    if (wt === 0) {
+      [val, pos] = decodeVarint(buf, pos);
+    } else if (wt === 2) {
+      let len; [len, pos] = decodeVarint(buf, pos);
+      val = buf.slice(pos, pos+len); pos += len;
+    } else if (wt === 1) { pos += 8; continue; }
+    else if (wt === 5) { pos += 4; continue; }
+    else break;
+    if (val === undefined) continue;
+    if (fields[fn] === undefined) fields[fn] = val;
+    else if (Array.isArray(fields[fn])) fields[fn].push(val);
+    else fields[fn] = [fields[fn], val];
   }
   return fields;
 }
 
-// ── Build cTrader messages ────────────────────────────────────────────────────
+function pbField(fn, wt, val) {
+  const tag = encodeVarint((fn<<3)|wt);
+  if (wt === 0) return Buffer.concat([tag, encodeVarint(val)]);
+  const vb = Buffer.isBuffer(val) ? val : Buffer.from(String(val), "utf8");
+  return Buffer.concat([tag, encodeVarint(vb.length), vb]);
+}
 
-function buildProtoMessage(payloadType, payload) {
-  // ProtoMessage: field 3 = payloadType (varint), field 5 = payload (bytes)
-  const typeField = writeField(3, 0, payloadType);
-  const payloadField = writeField(5, 2, payload);
-  const msg = Buffer.concat([typeField, payloadField]);
-  // Prefix with 4-byte big-endian length
-  const len = Buffer.alloc(4);
-  len.writeUInt32BE(msg.length, 0);
+function frame(pt, payload) {
+  const msg = Buffer.concat([pbField(3,0,pt), pbField(5,2,payload)]);
+  const len = Buffer.alloc(4); len.writeUInt32BE(msg.length, 0);
   return Buffer.concat([len, msg]);
 }
 
-function buildAppAuthReq(clientId, clientSecret) {
-  const payload = Buffer.concat([
-    writeField(2, 2, clientId),
-    writeField(3, 2, clientSecret),
-  ]);
-  return buildProtoMessage(PayloadType.PROTO_OA_APPLICATION_AUTH_REQ, payload);
+const buildAppAuth = (id,sec) => frame(PT.APP_AUTH_REQ, Buffer.concat([pbField(2,2,id), pbField(3,2,sec)]));
+const buildGetAccounts = (tok) => frame(PT.GET_ACCOUNTS_REQ, pbField(2,2,tok));
+const buildAccountAuth = (accId,tok) => frame(PT.ACCOUNT_AUTH_REQ, Buffer.concat([pbField(2,0,accId), pbField(3,2,tok)]));
+const buildDealList = (accId,from,to) => frame(PT.DEAL_LIST_REQ, Buffer.concat([pbField(2,0,accId), pbField(3,0,from), pbField(4,0,to), pbField(5,0,1000)]));
+
+function connect() {
+  return new Promise((res, rej) => {
+    const s = tls.connect({ host:CTRADER_HOST, port:CTRADER_PORT }, () => res(s));
+    s.on("error", rej);
+    setTimeout(() => rej(new Error("TCP timeout")), 15000);
+  });
 }
 
-function buildGetAccountListReq(accessToken) {
-  const payload = writeField(2, 2, accessToken);
-  return buildProtoMessage(PayloadType.PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_REQ, payload);
-}
-
-function buildAccountAuthReq(ctidTraderAccountId, accessToken) {
-  // ctidTraderAccountId is int64 — encode as two varints (lo, hi) or just use lo for accounts < 2^32
-  const idBuf = Buffer.alloc(8);
-  idBuf.writeBigInt64BE(BigInt(ctidTraderAccountId), 0);
-  const payload = Buffer.concat([
-    writeField(2, 0, ctidTraderAccountId),
-    writeField(3, 2, accessToken),
-  ]);
-  return buildProtoMessage(PayloadType.PROTO_OA_ACCOUNT_AUTH_REQ, payload);
-}
-
-function buildDealListReq(ctidTraderAccountId, fromTimestamp, toTimestamp) {
-  const payload = Buffer.concat([
-    writeField(2, 0, ctidTraderAccountId),
-    writeField(3, 0, fromTimestamp),
-    writeField(4, 0, toTimestamp),
-    writeField(5, 0, 1000), // maxRows
-  ]);
-  return buildProtoMessage(PayloadType.PROTO_OA_DEAL_LIST_REQ, payload);
-}
-
-// ── Parse response ────────────────────────────────────────────────────────────
-
-function parseProtoMessage(buf) {
-  const fields = decodeMessage(buf);
-  const payloadType = fields[3];
-  const payload = fields[5];
-  return { payloadType, payload };
-}
-
-function parseAccountList(payload) {
-  // Returns array of ctidTraderAccountId (field 3 in repeated ProtoOACtidTraderAccount, which has field 2 = ctidTraderAccountId)
-  const accounts = [];
-  let offset = 0;
-  while (offset < payload.length) {
-    const tag = readVarint(payload, offset);
-    offset = tag.offset;
-    const fieldNum = tag.value >> 3;
-    const wireType = tag.value & 0x7;
-    if (wireType === 2) {
-      const len = readVarint(payload, offset);
-      offset = len.offset;
-      const subBuf = payload.slice(offset, offset + len.value);
-      offset += len.value;
-      if (fieldNum === 3) {
-        // This is a ProtoOACtidTraderAccount message
-        const sub = decodeMessage(subBuf);
-        const accountId = sub[2]; // ctidTraderAccountId
-        if (accountId) accounts.push(accountId);
+function sendRecv(socket, msg, expectedPT, ms=10000) {
+  return new Promise((resolve, reject) => {
+    let buf = Buffer.alloc(0);
+    const timer = setTimeout(() => { socket.removeListener("data",onData); reject(new Error(`Timeout for PT ${expectedPT}`)); }, ms);
+    function onData(chunk) {
+      buf = Buffer.concat([buf, chunk]);
+      while (buf.length >= 4) {
+        const mlen = buf.readUInt32BE(0);
+        if (buf.length < 4+mlen) break;
+        const mbuf = buf.slice(4, 4+mlen); buf = buf.slice(4+mlen);
+        const outer = pbDecode(mbuf);
+        const pt = outer[3]; const payload = outer[5] || Buffer.alloc(0);
+        console.log(`RX pt=${pt}`);
+        if (pt === PT.ERROR_RES) {
+          const e = pbDecode(payload);
+          const code = e[2] ? (Buffer.isBuffer(e[2]) ? e[2].toString() : String(e[2])) : "ERR";
+          const desc = e[3] ? (Buffer.isBuffer(e[3]) ? e[3].toString() : String(e[3])) : "";
+          clearTimeout(timer); socket.removeListener("data",onData);
+          return reject(new Error(`cTrader ${code}: ${desc}`));
+        }
+        if (pt === expectedPT) {
+          clearTimeout(timer); socket.removeListener("data",onData);
+          return resolve(payload);
+        }
       }
-    } else if (wireType === 0) {
-      const v = readVarint(payload, offset);
-      offset = v.offset;
-    } else break;
+    }
+    socket.on("data", onData);
+    socket.write(msg);
+  });
+}
+
+function parseAccounts(payload) {
+  console.log("acc payload hex:", payload.slice(0,80).toString("hex"));
+  const top = pbDecode(payload);
+  console.log("acc top keys:", Object.keys(top));
+  const accounts = [];
+  // field 3 = repeated ProtoOACtidTraderAccount, field 2 inside = ctidTraderAccountId
+  const raw = top[3];
+  if (!raw) { console.log("no field 3"); return accounts; }
+  const items = Array.isArray(raw) ? raw : [raw];
+  for (const item of items) {
+    if (!Buffer.isBuffer(item)) continue;
+    const acc = pbDecode(item);
+    console.log("acc item keys:", Object.keys(acc), "field2:", acc[2]);
+    if (acc[2] !== undefined) accounts.push(Number(acc[2]));
   }
   return accounts;
 }
 
-function parseDealList(payload) {
-  const deals = [];
-  let offset = 0;
-  while (offset < payload.length) {
-    const tag = readVarint(payload, offset);
-    offset = tag.offset;
-    const fieldNum = tag.value >> 3;
-    const wireType = tag.value & 0x7;
-    if (wireType === 2) {
-      const len = readVarint(payload, offset);
-      offset = len.offset;
-      const subBuf = payload.slice(offset, offset + len.value);
-      offset += len.value;
-      if (fieldNum === 3) {
-        // ProtoOADeal message
-        const sub = decodeMessage(subBuf);
-        deals.push(sub);
-      }
-    } else if (wireType === 0) {
-      const v = readVarint(payload, offset);
-      offset = v.offset;
-    } else break;
+function parseDeals(payload) {
+  const top = pbDecode(payload);
+  const raw = top[3];
+  if (!raw) return [];
+  return Array.isArray(raw) ? raw : [raw];
+}
+
+function computeStats(dealBufs) {
+  const profits = [];
+  for (const d of dealBufs) {
+    if (!Buffer.isBuffer(d)) continue;
+    const deal = pbDecode(d);
+    if (deal[7] !== 2) continue; // not FILLED
+    if (!deal[10] || !Buffer.isBuffer(deal[10])) continue;
+    const cpd = pbDecode(deal[10]);
+    const gp = cpd[3] !== undefined ? Number(cpd[3]) : 0;
+    const md = cpd[9] !== undefined ? Number(cpd[9]) : 2;
+    profits.push(gp / Math.pow(10, md));
   }
-  return deals;
+  if (!profits.length) return { trades:0, pf:0, wr:0, dd:0, netProfit:0 };
+  const wins = profits.filter(p=>p>0), losses = profits.filter(p=>p<0);
+  const gpp = wins.reduce((s,p)=>s+p,0), gll = Math.abs(losses.reduce((s,p)=>s+p,0));
+  const pf = gll > 0 ? gpp/gll : gpp > 0 ? 9.99 : 0;
+  const wr = (wins.length/profits.length)*100;
+  const net = profits.reduce((s,p)=>s+p,0);
+  let peak=0,maxDD=0,cum=0;
+  profits.forEach(p=>{ cum+=p; if(cum>peak) peak=cum; const dd=peak>0?((peak-cum)/peak)*100:0; if(dd>maxDD) maxDD=dd; });
+  return { trades:profits.length, wins:wins.length, losses:losses.length, pf:Math.round(pf*100)/100, wr:Math.round(wr*10)/10, dd:Math.round(maxDD*10)/10, netProfit:Math.round(net*100)/100 };
 }
 
-// ── TCP connection helper ─────────────────────────────────────────────────────
-
-function connectCTrader() {
-  return new Promise((resolve, reject) => {
-    const socket = tls.connect({ host: CTRADER_HOST, port: CTRADER_PORT, rejectUnauthorized: true }, () => {
-      resolve(socket);
-    });
-    socket.on("error", reject);
-    setTimeout(() => reject(new Error("Connection timeout")), 10000);
-  });
-}
-
-function sendAndReceive(socket, message, expectedPayloadType, timeout = 8000) {
-  return new Promise((resolve, reject) => {
-    let buffer = Buffer.alloc(0);
-    const timer = setTimeout(() => reject(new Error(`Timeout waiting for ${expectedPayloadType}`)), timeout);
-
-    const onData = (data) => {
-      buffer = Buffer.concat([buffer, data]);
-      while (buffer.length >= 4) {
-        const msgLen = buffer.readUInt32BE(0);
-        if (buffer.length < 4 + msgLen) break;
-        const msgBuf = buffer.slice(4, 4 + msgLen);
-        buffer = buffer.slice(4 + msgLen);
-        const { payloadType, payload } = parseProtoMessage(msgBuf);
-        if (payloadType === PayloadType.PROTO_OA_ERROR_RES) {
-          clearTimeout(timer);
-          socket.removeListener("data", onData);
-          const errFields = decodeMessage(payload);
-          reject(new Error(`cTrader error: ${errFields[2] ? errFields[2].toString() : "Unknown"}`));
-          return;
-        }
-        if (payloadType === expectedPayloadType) {
-          clearTimeout(timer);
-          socket.removeListener("data", onData);
-          resolve(payload);
-          return;
-        }
-      }
-    };
-
-    socket.on("data", onData);
-    socket.write(message);
-  });
-}
-
-// ── Main fetch function ───────────────────────────────────────────────────────
-
-async function fetchDeals(accessToken, months) {
-  const socket = await connectCTrader();
-
+async function fetchOOS(token, months) {
+  console.log("Connecting...");
+  const socket = await connect();
   try {
-    // 1. App auth
-    await sendAndReceive(socket, buildAppAuthReq(CLIENT_ID, CLIENT_SECRET), PayloadType.PROTO_OA_APPLICATION_AUTH_RES);
-
-    // 2. Get account list
-    const accountListPayload = await sendAndReceive(socket, buildGetAccountListReq(accessToken), PayloadType.PROTO_OA_GET_ACCOUNT_LIST_BY_ACCESS_TOKEN_RES);
-    const accounts = parseAccountList(accountListPayload);
-    if (!accounts.length) throw new Error("No accounts found for this access token");
-
-    const accountId = accounts[0];
-
-    // 3. Account auth
-    await sendAndReceive(socket, buildAccountAuthReq(accountId, accessToken), PayloadType.PROTO_OA_ACCOUNT_AUTH_RES);
-
-    // 4. Fetch deals
-    const toTs = Date.now();
-    const fromTs = toTs - (months * 30 * 24 * 60 * 60 * 1000);
-    const dealListPayload = await sendAndReceive(socket, buildDealListReq(accountId, fromTs, toTs), PayloadType.PROTO_OA_DEAL_LIST_RES);
-    const deals = parseDealList(dealListPayload);
-
+    await sendRecv(socket, buildAppAuth(CLIENT_ID, CLIENT_SECRET), PT.APP_AUTH_RES);
+    console.log("App auth OK");
+    const accPay = await sendRecv(socket, buildGetAccounts(token), PT.GET_ACCOUNTS_RES);
+    const accounts = parseAccounts(accPay);
+    console.log("Accounts:", accounts);
+    if (!accounts.length) throw new Error("No accounts found for this token");
+    const accId = accounts[0];
+    await sendRecv(socket, buildAccountAuth(accId, token), PT.ACCOUNT_AUTH_RES);
+    console.log("Account auth OK");
+    const to = Date.now(), from = to - months*30*24*60*60*1000;
+    const dealPay = await sendRecv(socket, buildDealList(accId, from, to), PT.DEAL_LIST_RES);
+    const deals = parseDeals(dealPay);
+    console.log(`Deals: ${deals.length}`);
     socket.destroy();
-    return { accounts, accountId, deals };
-  } catch (e) {
-    socket.destroy();
-    throw e;
-  }
+    return computeStats(deals);
+  } catch(e) { socket.destroy(); throw e; }
 }
 
-// ── Compute stats from deals ──────────────────────────────────────────────────
+app.get("/health", (req,res) => res.json({ status:"ok", configured: !!(CLIENT_ID && CLIENT_SECRET) }));
 
-function computeStats(deals, months) {
-  // ProtoOADeal fields:
-  // field 2 = dealId, field 3 = orderId, field 4 = positionId
-  // field 7 = dealStatus (2=FILLED), field 10 = closePositionDetail (sub-message)
-  // closePositionDetail field 3 = grossProfit (int64, in 1/100 currency units)
-  // field 9 = moneyDigits
-
-  const closedDeals = deals.filter(d => d[7] === 2); // FILLED
-  if (!closedDeals.length) return { trades: 0, pf: 0, wr: 0, dd: 0, netProfit: 0 };
-
-  const profits = closedDeals.map(d => {
-    if (d[10] && Buffer.isBuffer(d[10])) {
-      const closeDetail = decodeMessage(d[10]);
-      const grossProfit = closeDetail[3] || 0;
-      const moneyDigits = closeDetail[9] || 2;
-      return grossProfit / Math.pow(10, moneyDigits);
-    }
-    return 0;
-  });
-
-  const wins = profits.filter(p => p > 0);
-  const losses = profits.filter(p => p < 0);
-  const grossProfit = wins.reduce((s, p) => s + p, 0);
-  const grossLoss = Math.abs(losses.reduce((s, p) => s + p, 0));
-  const pf = grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 9.99 : 0;
-  const wr = (wins.length / closedDeals.length) * 100;
-  const netProfit = profits.reduce((s, p) => s + p, 0);
-
-  // Max drawdown
-  let peak = 0, maxDD = 0, cum = 0;
-  profits.forEach(p => {
-    cum += p;
-    if (cum > peak) peak = cum;
-    const dd = peak > 0 ? ((peak - cum) / peak) * 100 : 0;
-    if (dd > maxDD) maxDD = dd;
-  });
-
-  return {
-    trades: closedDeals.length,
-    wins: wins.length,
-    losses: losses.length,
-    pf: Math.round(pf * 100) / 100,
-    wr: Math.round(wr * 10) / 10,
-    dd: Math.round(maxDD * 10) / 10,
-    netProfit: Math.round(netProfit * 100) / 100,
-  };
-}
-
-// ── HTTP endpoint ─────────────────────────────────────────────────────────────
-
-app.get("/health", (req, res) => res.json({ status: "ok" }));
-
-app.get("/oos", async (req, res) => {
-  const { token, months = 3 } = req.query;
-  if (!token) return res.status(401).json({ error: "No access token" });
-  if (!CLIENT_ID || !CLIENT_SECRET) return res.status(500).json({ error: "Server not configured" });
-
+app.get("/oos", async (req,res) => {
+  const { token, months=3 } = req.query;
+  if (!token) return res.status(401).json({ error:"No token" });
+  if (!CLIENT_ID||!CLIENT_SECRET) return res.status(500).json({ error:"Env vars missing" });
   try {
-    const { deals } = await fetchDeals(token, parseInt(months));
-    const stats = computeStats(deals, parseInt(months));
-    res.json({ ...stats, period: `Last ${months} months` });
-  } catch (e) {
+    const stats = await fetchOOS(token, parseInt(months));
+    res.json({ ...stats, period:`Last ${months} months` });
+  } catch(e) {
+    console.error("Error:", e.message);
     res.status(500).json({ error: e.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`cTrader proxy running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`cTrader proxy v2 on port ${PORT}`));
