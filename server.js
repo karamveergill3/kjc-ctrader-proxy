@@ -1,6 +1,6 @@
 /**
- * KJC Arena — cTrader Open API Proxy Server v5
- * Fixed: account parsing - try all fields for account ID
+ * KJC Arena — cTrader Open API Proxy Server v6
+ * Fixed: proper int64 reading for large account IDs
  */
 const tls = require("tls");
 const express = require("express");
@@ -21,6 +21,7 @@ const PT = {
   ERROR_RES: 2142, HEARTBEAT: 51,
 };
 
+// ── Varint with BigInt support for int64 ──────────────────────────────────────
 function encodeVarint(n) {
   const out = []; n = Number(n);
   while (n > 127) { out.push((n & 0x7f) | 0x80); n = Math.floor(n / 128); }
@@ -28,10 +29,11 @@ function encodeVarint(n) {
 }
 
 function decodeVarint(buf, pos) {
-  let result = 0, shift = 0;
+  let result = BigInt(0), shift = BigInt(0);
   while (pos < buf.length) {
     const b = buf[pos++];
-    result += (b & 0x7f) * Math.pow(2, shift); shift += 7;
+    result |= BigInt(b & 0x7f) << shift;
+    shift += BigInt(7);
     if (!(b & 0x80)) break;
   }
   return [result, pos];
@@ -41,9 +43,14 @@ function pbDecode(buf) {
   const fields = {}; let pos = 0;
   while (pos < buf.length) {
     let tag; [tag, pos] = decodeVarint(buf, pos);
-    const fn = tag >>> 3, wt = tag & 7; let val;
+    const fn = Number(tag >> BigInt(3)), wt = Number(tag & BigInt(7));
+    let val;
     if (wt === 0) { [val, pos] = decodeVarint(buf, pos); }
-    else if (wt === 2) { let len; [len, pos] = decodeVarint(buf, pos); val = buf.slice(pos, pos + len); pos += len; }
+    else if (wt === 2) {
+      let len; [len, pos] = decodeVarint(buf, pos);
+      len = Number(len);
+      val = buf.slice(pos, pos + len); pos += len;
+    }
     else if (wt === 1) { pos += 8; continue; }
     else if (wt === 5) { pos += 4; continue; }
     else break;
@@ -68,10 +75,37 @@ function frame(payloadType, payload) {
   return Buffer.concat([len, msg]);
 }
 
-const buildAppAuth = (id, sec) => frame(PT.APP_AUTH_REQ, Buffer.concat([pbField(2, 2, id), pbField(3, 2, sec)]));
+// Encode int64 varint properly for large account IDs
+function encodeInt64Field(fn, value) {
+  const tag = encodeVarint((fn << 3) | 0);
+  const out = [];
+  let n = BigInt(value);
+  while (n > BigInt(127)) {
+    out.push(Number(n & BigInt(0x7f)) | 0x80);
+    n >>= BigInt(7);
+  }
+  out.push(Number(n & BigInt(0x7f)));
+  return Buffer.concat([tag, Buffer.from(out)]);
+}
+
+const buildAppAuth = (id, sec) => frame(PT.APP_AUTH_REQ,
+  Buffer.concat([pbField(2, 2, id), pbField(3, 2, sec)]));
+
 const buildGetAccounts = (tok) => frame(PT.GET_ACCOUNTS_REQ, pbField(2, 2, tok));
-const buildAccountAuth = (accId, tok) => frame(PT.ACCOUNT_AUTH_REQ, Buffer.concat([pbField(2, 0, accId), pbField(3, 2, tok)]));
-const buildDealList = (accId, from, to) => frame(PT.DEAL_LIST_REQ, Buffer.concat([pbField(2, 0, accId), pbField(3, 0, from), pbField(4, 0, to), pbField(5, 0, 1000)]));
+
+function buildAccountAuth(accId, tok) {
+  return frame(PT.ACCOUNT_AUTH_REQ,
+    Buffer.concat([encodeInt64Field(2, accId), pbField(3, 2, tok)]));
+}
+
+function buildDealList(accId, from, to) {
+  return frame(PT.DEAL_LIST_REQ, Buffer.concat([
+    encodeInt64Field(2, accId),
+    encodeInt64Field(3, from),
+    encodeInt64Field(4, to),
+    pbField(5, 0, 1000)
+  ]));
+}
 
 function connect() {
   return new Promise((resolve, reject) => {
@@ -84,7 +118,10 @@ function connect() {
 function sendRecv(socket, msg, expectedPT, ms = 20000) {
   return new Promise((resolve, reject) => {
     let buf = Buffer.alloc(0);
-    const timer = setTimeout(() => { socket.removeListener("data", onData); reject(new Error(`Timeout PT ${expectedPT}`)); }, ms);
+    const timer = setTimeout(() => {
+      socket.removeListener("data", onData);
+      reject(new Error(`Timeout PT ${expectedPT}`));
+    }, ms);
     function onData(chunk) {
       buf = Buffer.concat([buf, chunk]);
       while (buf.length >= 4) {
@@ -92,7 +129,7 @@ function sendRecv(socket, msg, expectedPT, ms = 20000) {
         if (buf.length < 4 + mlen) break;
         const mbuf = buf.slice(4, 4 + mlen); buf = buf.slice(4 + mlen);
         const outer = pbDecode(mbuf);
-        const pt = outer[1]; const payload = outer[2] || Buffer.alloc(0);
+        const pt = Number(outer[1]); const payload = outer[2] || Buffer.alloc(0);
         console.log(`RX pt=${pt}`);
         if (pt === PT.HEARTBEAT) { socket.write(frame(PT.HEARTBEAT, Buffer.alloc(0))); continue; }
         if (pt === PT.ERROR_RES) {
@@ -110,36 +147,26 @@ function sendRecv(socket, msg, expectedPT, ms = 20000) {
 }
 
 function parseAccounts(payload) {
-  // Log raw hex for debugging
-  console.log("ACC payload hex:", payload.slice(0, 100).toString("hex"));
+  console.log("ACC hex:", payload.slice(0, 80).toString("hex"));
   const top = pbDecode(payload);
-  console.log("ACC top fields:", JSON.stringify(Object.keys(top)));
-
+  console.log("ACC fields:", Object.keys(top));
   const accounts = [];
-
-  // Try field 3 first (repeated ProtoOACtidTraderAccount)
-  // ProtoOACtidTraderAccount has field 2 = ctidTraderAccountId
-  const tryFields = [3, 2, 4, 1];
-  for (const f of tryFields) {
-    const raw = top[f];
-    if (!raw) continue;
-    const items = Array.isArray(raw) ? raw : [raw];
-    for (const item of items) {
-      if (Buffer.isBuffer(item)) {
-        const acc = pbDecode(item);
-        console.log(`Field ${f} sub-fields:`, JSON.stringify(Object.keys(acc)));
-        // Try field 2 first (ctidTraderAccountId), then field 1
-        const id = acc[2] !== undefined ? acc[2] : acc[1];
-        if (id !== undefined) {
-          accounts.push(Number(id));
-          console.log(`Found account ID: ${Number(id)}`);
-        }
-      } else if (typeof item === "number" && item > 0) {
-        accounts.push(item);
-        console.log(`Found account ID (direct): ${item}`);
-      }
+  // field 3 = repeated ProtoOACtidTraderAccount
+  const raw = top[3];
+  if (!raw) { console.log("No field 3"); return accounts; }
+  const items = Array.isArray(raw) ? raw : [raw];
+  for (const item of items) {
+    if (!Buffer.isBuffer(item)) continue;
+    const acc = pbDecode(item);
+    console.log("Account item fields:", Object.keys(acc), "values:", JSON.stringify(
+      Object.fromEntries(Object.entries(acc).map(([k,v]) => [k, typeof v === 'bigint' ? v.toString() : Buffer.isBuffer(v) ? v.toString('hex') : v]))
+    ));
+    // field 2 = ctidTraderAccountId (int64)
+    if (acc[2] !== undefined) {
+      const id = typeof acc[2] === 'bigint' ? acc[2] : BigInt(acc[2]);
+      accounts.push(id);
+      console.log(`Account ID: ${id}`);
     }
-    if (accounts.length) break;
   }
   return accounts;
 }
@@ -155,7 +182,7 @@ function computeStats(dealBufs) {
   for (const d of dealBufs) {
     if (!Buffer.isBuffer(d)) continue;
     const deal = pbDecode(d);
-    if (deal[7] !== 2) continue;
+    if (Number(deal[7]) !== 2) continue;
     if (!deal[10] || !Buffer.isBuffer(deal[10])) continue;
     const cpd = pbDecode(deal[10]);
     const gp = cpd[3] !== undefined ? Number(cpd[3]) : 0;
@@ -180,12 +207,12 @@ async function fetchOOS(token, months) {
     console.log("App auth OK");
     const accPay = await sendRecv(socket, buildGetAccounts(token), PT.GET_ACCOUNTS_RES);
     const accounts = parseAccounts(accPay);
-    console.log("Accounts found:", accounts);
-    if (!accounts.length) throw new Error("No accounts found — check token has account access");
+    console.log("Accounts:", accounts.map(a => a.toString()));
+    if (!accounts.length) throw new Error("No accounts found");
     const accId = accounts[0];
     await sendRecv(socket, buildAccountAuth(accId, token), PT.ACCOUNT_AUTH_RES);
-    console.log("Account auth OK for", accId);
-    const to = Date.now(), from = to - months * 30 * 24 * 60 * 60 * 1000;
+    console.log("Account auth OK for", accId.toString());
+    const to = BigInt(Date.now()), from = to - BigInt(months) * BigInt(30 * 24 * 60 * 60 * 1000);
     const dealPay = await sendRecv(socket, buildDealList(accId, from, to), PT.DEAL_LIST_RES);
     const deals = parseDeals(dealPay);
     console.log(`Got ${deals.length} deals`);
@@ -206,4 +233,4 @@ app.get("/oos", async (req, res) => {
   } catch (e) { console.error("Error:", e.message); res.status(500).json({ error: e.message }); }
 });
 
-app.listen(PORT, () => console.log(`cTrader proxy v5 on port ${PORT}`));
+app.listen(PORT, () => console.log(`cTrader proxy v6 on port ${PORT}`));
