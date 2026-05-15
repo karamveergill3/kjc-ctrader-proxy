@@ -22,40 +22,105 @@ const PT = { APP_AUTH_REQ:2100,APP_AUTH_RES:2101,ACCOUNT_AUTH_REQ:2102,ACCOUNT_A
 
 // ── WebSocket Bridge ──────────────────────────────────────────────────────────
 const wsSessions = new Map();
+// Plugin connections (cTrader plugin — no sessionId, just one global plugin slot)
+let pluginWs = null;
 
 wss.on("connection", (ws, req) => {
   const isDesktop = req.headers["x-client"]?.includes("KJCArenaDesktop");
   let sessionId = null;
+  let isPlugin = false;
   console.log(`WS connect: ${isDesktop ? "desktop" : "browser"}`);
 
   ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data.toString());
+
+      // Plugin registration (cTrader plugin — no sessionId needed)
+      if (msg.type === "REGISTER_PLUGIN") {
+        isPlugin = true;
+        pluginWs = ws;
+        ws.send(JSON.stringify({ type: "REGISTERED_PLUGIN", version: "1.0" }));
+        console.log("Plugin registered");
+        // Notify all browser sessions that plugin is connected
+        for (const [sid, pair] of wsSessions) {
+          if (pair.browser?.readyState === 1) {
+            pair.browser.send(JSON.stringify({ type: "DESKTOP_CONNECTED" }));
+          }
+        }
+        return;
+      }
+
       if (msg.type === "REGISTER") {
         sessionId = msg.sessionId;
         if (!wsSessions.has(sessionId)) wsSessions.set(sessionId, {});
         if (isDesktop) wsSessions.get(sessionId).desktop = ws;
-        else { wsSessions.get(sessionId).browser = ws; const p = wsSessions.get(sessionId); if (p.desktop?.readyState === 1) ws.send(JSON.stringify({ type:"DESKTOP_CONNECTED" })); }
-        ws.send(JSON.stringify({ type:"REGISTERED", sessionId }));
+        else {
+          wsSessions.get(sessionId).browser = ws;
+          const p = wsSessions.get(sessionId);
+          // Check if desktop OR plugin is connected
+          const hasDesktop = p.desktop?.readyState === 1;
+          const hasPlugin = pluginWs?.readyState === 1;
+          if (hasDesktop || hasPlugin) ws.send(JSON.stringify({ type: "DESKTOP_CONNECTED" }));
+        }
+        ws.send(JSON.stringify({ type: "REGISTERED", sessionId }));
         return;
       }
+
       if (msg.type === "PING") {
-        ws.send(JSON.stringify({ type:"PONG", version:"1.0" }));
-        if (isDesktop && sessionId && wsSessions.has(sessionId)) { const p = wsSessions.get(sessionId); if (p.browser?.readyState===1) p.browser.send(JSON.stringify({type:"DESKTOP_CONNECTED"})); }
+        ws.send(JSON.stringify({ type: "PONG", version: "1.0" }));
+        if (isDesktop && sessionId && wsSessions.has(sessionId)) {
+          const p = wsSessions.get(sessionId);
+          if (p.browser?.readyState === 1) p.browser.send(JSON.stringify({ type: "DESKTOP_CONNECTED" }));
+        }
+        if (isPlugin) {
+          // Notify all browsers plugin is alive
+          for (const [sid, pair] of wsSessions) {
+            if (pair.browser?.readyState === 1) pair.browser.send(JSON.stringify({ type: "DESKTOP_CONNECTED" }));
+          }
+        }
         return;
       }
+
+      // Route messages between browser and desktop/plugin
       if (sessionId && wsSessions.has(sessionId)) {
         const pair = wsSessions.get(sessionId);
-        const target = isDesktop ? pair.browser : pair.desktop;
-        if (target?.readyState === 1) target.send(data.toString());
+        if (isDesktop) {
+          // Desktop -> browser
+          if (pair.browser?.readyState === 1) pair.browser.send(data.toString());
+        } else {
+          // Browser -> desktop or plugin
+          const target = pair.desktop;
+          if (target?.readyState === 1) {
+            target.send(data.toString());
+          } else if (pluginWs?.readyState === 1) {
+            // No desktop — route to plugin instead, attach sessionId
+            const withSession = { ...msg, sessionId };
+            pluginWs.send(JSON.stringify(withSession));
+          }
+        }
+      } else if (isPlugin) {
+        // Plugin sending results — route to correct browser session
+        const targetSessionId = msg.sessionId;
+        if (targetSessionId && wsSessions.has(targetSessionId)) {
+          const pair = wsSessions.get(targetSessionId);
+          if (pair.browser?.readyState === 1) pair.browser.send(data.toString());
+        }
       }
     } catch(e) { console.error("WS msg error:", e.message); }
   });
 
   ws.on("close", () => {
+    if (isPlugin) {
+      pluginWs = null;
+      console.log("Plugin disconnected");
+      for (const [sid, pair] of wsSessions) {
+        if (pair.browser?.readyState === 1) pair.browser.send(JSON.stringify({ type: "DESKTOP_DISCONNECTED" }));
+      }
+      return;
+    }
     if (sessionId && wsSessions.has(sessionId)) {
       const pair = wsSessions.get(sessionId);
-      if (isDesktop) { delete pair.desktop; if (pair.browser?.readyState===1) pair.browser.send(JSON.stringify({type:"DESKTOP_DISCONNECTED"})); }
+      if (isDesktop) { delete pair.desktop; if (pair.browser?.readyState === 1) pair.browser.send(JSON.stringify({ type: "DESKTOP_DISCONNECTED" })); }
       else delete pair.browser;
       if (!pair.desktop && !pair.browser) wsSessions.delete(sessionId);
     }
@@ -101,7 +166,7 @@ async function fetchOOS(token,months) {
 }
 
 // ── HTTP endpoints ────────────────────────────────────────────────────────────
-app.get("/health",(req,res)=>res.json({status:"ok",configured:!!(CLIENT_ID&&CLIENT_SECRET),sessions:wsSessions.size}));
+app.get("/health",(req,res)=>res.json({status:"ok",configured:!!(CLIENT_ID&&CLIENT_SECRET),sessions:wsSessions.size,pluginConnected:!!(pluginWs?.readyState===1)}));
 app.get("/oos",async(req,res)=>{ const{token,months=3}=req.query; if(!token)return res.status(401).json({error:"No token"}); if(!CLIENT_ID||!CLIENT_SECRET)return res.status(500).json({error:"Env vars missing"}); try{const stats=await fetchOOS(token,parseInt(months));res.json(stats);}catch(e){console.error("OOS error:",e.message);res.status(500).json({error:e.message});} });
 
 server.listen(PORT,()=>console.log(`KJC Arena proxy+bridge on port ${PORT}`));
