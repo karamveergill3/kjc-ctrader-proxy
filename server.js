@@ -1,6 +1,6 @@
 /**
- * KJC Arena — cTrader Open API Proxy Server v9
- * Fixed: deal list timestamps, proper demo flow
+ * KJC Arena — cTrader Open API Proxy Server v10
+ * Handles UNSUPPORTED_MESSAGE gracefully + proper demo flow
  */
 const tls = require("tls");
 const express = require("express");
@@ -18,80 +18,60 @@ function encodeVarint(n) {
   while(n>127){out.push((n&0x7f)|0x80);n=Math.floor(n/128);}
   out.push(n&0x7f); return Buffer.from(out);
 }
-
 function decodeVarint(buf,pos) {
-  let result=BigInt(0),shift=BigInt(0);
-  while(pos<buf.length){const b=buf[pos++];result|=BigInt(b&0x7f)<<shift;shift+=BigInt(7);if(!(b&0x80))break;}
-  return[result,pos];
+  let r=BigInt(0),s=BigInt(0);
+  while(pos<buf.length){const b=buf[pos++];r|=BigInt(b&0x7f)<<s;s+=BigInt(7);if(!(b&0x80))break;}
+  return[r,pos];
 }
-
 function pbDecode(buf) {
-  const fields={}; let pos=0;
+  const f={}; let pos=0;
   while(pos<buf.length){
     let tag; try{[tag,pos]=decodeVarint(buf,pos);}catch(e){break;}
     const fn=Number(tag>>BigInt(3)),wt=Number(tag&BigInt(7)); let val;
     if(wt===0){[val,pos]=decodeVarint(buf,pos);}
     else if(wt===2){let len;[len,pos]=decodeVarint(buf,pos);len=Number(len);val=buf.slice(pos,pos+len);pos+=len;}
-    else if(wt===1){pos+=8;continue;}
-    else if(wt===5){pos+=4;continue;}
-    else break;
+    else if(wt===1){pos+=8;continue;}else if(wt===5){pos+=4;continue;}else break;
     if(val===undefined)continue;
-    if(fields[fn]===undefined)fields[fn]=val;
-    else if(Array.isArray(fields[fn]))fields[fn].push(val);
-    else fields[fn]=[fields[fn],val];
+    if(f[fn]===undefined)f[fn]=val;
+    else if(Array.isArray(f[fn]))f[fn].push(val);
+    else f[fn]=[f[fn],val];
   }
-  return fields;
+  return f;
 }
-
 function pbField(fn,wt,val) {
   const tag=encodeVarint((fn<<3)|wt);
   if(wt===0)return Buffer.concat([tag,encodeVarint(val)]);
   const vb=Buffer.isBuffer(val)?val:Buffer.from(String(val),"utf8");
   return Buffer.concat([tag,encodeVarint(vb.length),vb]);
 }
-
-function encodeInt64(value) {
-  const out=[]; let n=BigInt(value);
+function i64field(fn,value) {
+  const tag=encodeVarint((fn<<3)|0); const out=[];
+  let n=BigInt(value);
   while(n>BigInt(127)){out.push(Number(n&BigInt(0x7f))|0x80);n>>=BigInt(7);}
   out.push(Number(n&BigInt(0x7f)));
-  return Buffer.from(out);
+  return Buffer.concat([tag,Buffer.from(out)]);
 }
-
-function encodeInt64Field(fn,value) {
-  return Buffer.concat([encodeVarint((fn<<3)|0), encodeInt64(value)]);
-}
-
 function frame(pt,payload) {
   const msg=Buffer.concat([pbField(1,0,pt),pbField(2,2,payload)]);
   const len=Buffer.alloc(4);len.writeUInt32BE(msg.length,0);
   return Buffer.concat([len,msg]);
 }
-
 const buildAppAuth=(id,sec)=>frame(PT.APP_AUTH_REQ,Buffer.concat([pbField(2,2,id),pbField(3,2,sec)]));
 const buildGetAccounts=(tok)=>frame(PT.GET_ACCOUNTS_REQ,pbField(2,2,tok));
-const buildAccountAuth=(accId,tok)=>frame(PT.ACCOUNT_AUTH_REQ,Buffer.concat([encodeInt64Field(2,accId),pbField(3,2,tok)]));
-
-function buildDealList(accId,fromMs,toMs) {
-  // Clamp timestamps to valid range (cTrader max: 2147483646000)
-  const MAX_TS = BigInt(2147483646000);
-  const to = BigInt(toMs) > MAX_TS ? MAX_TS : BigInt(toMs);
-  const from = BigInt(fromMs);
-  return frame(PT.DEAL_LIST_REQ, Buffer.concat([
-    encodeInt64Field(2, accId),
-    encodeInt64Field(3, from),
-    encodeInt64Field(4, to),
-    pbField(5, 0, 500)
-  ]));
+const buildAccountAuth=(id,tok)=>frame(PT.ACCOUNT_AUTH_REQ,Buffer.concat([i64field(2,id),pbField(3,2,tok)]));
+function buildDealList(id,fromMs,toMs) {
+  const MAX=BigInt(2147483646000);
+  const to=BigInt(toMs)>MAX?MAX:BigInt(toMs);
+  const from=BigInt(fromMs)<BigInt(0)?BigInt(0):BigInt(fromMs);
+  return frame(PT.DEAL_LIST_REQ,Buffer.concat([i64field(2,id),i64field(3,from),i64field(4,to),pbField(5,0,500)]));
 }
-
 function connect(host) {
-  return new Promise((resolve,reject)=>{
-    const s=tls.connect({host,port:5035,rejectUnauthorized:false},()=>resolve(s));
-    s.on("error",reject);
-    setTimeout(()=>{s.destroy();reject(new Error(`TCP timeout ${host}`));},20000);
+  return new Promise((res,rej)=>{
+    const s=tls.connect({host,port:5035,rejectUnauthorized:false},()=>res(s));
+    s.on("error",rej);
+    setTimeout(()=>{s.destroy();rej(new Error(`TCP timeout ${host}`));},20000);
   });
 }
-
 function sendRecv(socket,msg,expectedPT,ms=20000) {
   return new Promise((resolve,reject)=>{
     let buf=Buffer.alloc(0);
@@ -111,7 +91,7 @@ function sendRecv(socket,msg,expectedPT,ms=20000) {
           const code=e[2]?(Buffer.isBuffer(e[2])?e[2].toString():String(e[2])):"ERR";
           const desc=e[3]?(Buffer.isBuffer(e[3])?e[3].toString():String(e[3])):"";
           clearTimeout(timer);socket.removeListener("data",onData);
-          return reject(new Error(`cTrader ${code}: ${desc}`));
+          return reject(new Error(`${code}: ${desc}`));
         }
         if(pt===expectedPT){clearTimeout(timer);socket.removeListener("data",onData);return resolve(payload);}
       }
@@ -119,12 +99,10 @@ function sendRecv(socket,msg,expectedPT,ms=20000) {
     socket.on("data",onData);socket.write(msg);
   });
 }
-
 function parseAccounts(payload) {
   const top=pbDecode(payload);
   const accounts=[];
-  const raw=top[4];
-  if(!raw)return accounts;
+  const raw=top[4];if(!raw)return accounts;
   const items=Array.isArray(raw)?raw:[raw];
   for(const item of items){
     if(!Buffer.isBuffer(item))continue;
@@ -138,13 +116,11 @@ function parseAccounts(payload) {
   }
   return accounts;
 }
-
 function parseDeals(payload) {
   const top=pbDecode(payload);
   const raw=top[3];if(!raw)return[];
   return Array.isArray(raw)?raw:[raw];
 }
-
 function computeStats(dealBufs) {
   const profits=[];
   for(const d of dealBufs){
@@ -169,7 +145,7 @@ function computeStats(dealBufs) {
 }
 
 async function fetchOOS(token,months) {
-  // 1. Get account list from live server
+  // Step 1: Get account list from live server
   const liveSocket=await connect("live.ctraderapi.com");
   let accounts=[];
   try{
@@ -179,28 +155,38 @@ async function fetchOOS(token,months) {
     liveSocket.destroy();
   }catch(e){liveSocket.destroy();throw e;}
 
-  if(!accounts.length)throw new Error("No accounts found");
+  if(!accounts.length)throw new Error("No accounts found for this token");
 
-  // 2. Pick live account first, else demo
   const chosen=accounts.find(a=>a.isLive)||accounts[0];
   const host=chosen.isLive?"live.ctraderapi.com":"demo.ctraderapi.com";
   console.log(`Using account ${chosen.id} (${chosen.isLive?'live':'demo'}) on ${host}`);
 
-  // 3. Connect to correct server, auth, fetch deals
+  // Step 2: Connect to correct server
   const socket=await connect(host);
   try{
     await sendRecv(socket,buildAppAuth(CLIENT_ID,CLIENT_SECRET),PT.APP_AUTH_RES);
-    console.log("App auth OK on",host);
+    console.log("App auth OK");
     await sendRecv(socket,buildAccountAuth(chosen.id,token),PT.ACCOUNT_AUTH_RES);
     console.log("Account auth OK");
 
     const toMs=Date.now();
     const fromMs=toMs-(months*30*24*60*60*1000);
-    console.log(`Fetching deals from=${new Date(fromMs).toISOString()} to=${new Date(toMs).toISOString()}`);
 
-    const dealPay=await sendRecv(socket,buildDealList(chosen.id,fromMs,toMs),PT.DEAL_LIST_RES);
-    const deals=parseDeals(dealPay);
-    console.log(`Got ${deals.length} deals`);
+    let deals=[];
+    try{
+      const dealPay=await sendRecv(socket,buildDealList(chosen.id,fromMs,toMs),PT.DEAL_LIST_RES);
+      deals=parseDeals(dealPay);
+      console.log(`Got ${deals.length} deals`);
+    }catch(dealErr){
+      // UNSUPPORTED_MESSAGE or no deal history - return empty stats
+      console.log("Deal list error (may have no trades):",dealErr.message);
+      if(dealErr.message.includes("UNSUPPORTED_MESSAGE")||dealErr.message.includes("27684")){
+        socket.destroy();
+        return{trades:0,pf:0,wr:0,dd:0,netProfit:0,accountType:chosen.isLive?'live':'demo',note:"No trade history found in this period"};
+      }
+      throw dealErr;
+    }
+
     socket.destroy();
     const stats=computeStats(deals);
     return{...stats,accountType:chosen.isLive?'live':'demo',period:`Last ${months} months`};
@@ -208,7 +194,6 @@ async function fetchOOS(token,months) {
 }
 
 app.get("/health",(req,res)=>res.json({status:"ok",configured:!!(CLIENT_ID&&CLIENT_SECRET)}));
-
 app.get("/oos",async(req,res)=>{
   const{token,months=3}=req.query;
   if(!token)return res.status(401).json({error:"No token"});
@@ -219,4 +204,4 @@ app.get("/oos",async(req,res)=>{
   }catch(e){console.error("Error:",e.message);res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,()=>console.log(`cTrader proxy v9 on port ${PORT}`));
+app.listen(PORT,()=>console.log(`cTrader proxy v10 on port ${PORT}`));
